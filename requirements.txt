@@ -1,0 +1,4 @@
+Pillow
+requests
+pytesseract
+boto3
