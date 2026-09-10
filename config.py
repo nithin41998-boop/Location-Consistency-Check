@@ -68,6 +68,16 @@ MAJOR_WEATHER_MISMATCH_PAIRS = [
     ("fog", "clear"),
 ]
 
+# Confidence score (0-100) below which a non-flagged claim gets a
+# "Warning" verdict instead of "Approved"
+CONFIDENCE_WARNING_THRESHOLD = 70
+
+# Maximum score allowed when the photo contains no actual street name,
+# shop name, or other fixed location-indicating text - even if every
+# other check passes, the claim can't be treated as fully confirmed
+# without at least some real location evidence in the image itself.
+NO_STREET_NAME_SCORE_CAP = 90
+
 # =========================================================
 # VISION LLM SETTINGS
 # =========================================================

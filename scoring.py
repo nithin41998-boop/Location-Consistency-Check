@@ -8,8 +8,16 @@ Implements the decision logic we finalized:
   - Both together                     -> FLAG, severity "critical"
   - Everything else (Tier 4, minor weather mismatch, OCR/vision
     disagreement, missing EXIF, etc.) contributes to a soft confidence
-    score but does NOT trigger an automatic flag on its own.
+    score (0-100) but does NOT trigger an automatic flag on its own.
+
+Every claim gets one of three plain verdicts:
+  - "Flagged"  - an automatic hard-trigger fired (see determine_flag)
+  - "Warning"  - no hard trigger, but the confidence score is below
+                 config.CONFIDENCE_WARNING_THRESHOLD
+  - "Approved" - no hard trigger, and the confidence score is high enough
 """
+
+import config
 
 
 def determine_flag(tier3_result, weather_mismatch_level):
@@ -34,11 +42,23 @@ def determine_flag(tier3_result, weather_mismatch_level):
     return False, "none", ""
 
 
+def determine_verdict(flagged, score_0_100):
+    """
+    Turns the hard-trigger flag plus the soft confidence score into one
+    plain-language verdict for the reviewer-facing CSV.
+    """
+    if flagged:
+        return "Flagged"
+    if score_0_100 < config.CONFIDENCE_WARNING_THRESHOLD:
+        return "Warning"
+    return "Approved"
+
+
 def soft_confidence_score(checks):
     """
-    Combines the non-auto-flagging signals into a 0-1 confidence score.
-    'checks' is a dict of individual results already computed elsewhere,
-    e.g.:
+    Combines the non-auto-flagging signals into a confidence score out
+    of 100. 'checks' is a dict of individual results already computed
+    elsewhere, e.g.:
       {
         "tier1_agreement": "AGREE" | "DISAGREE" | "PARTIAL" | "N/A",
         "tier4_result": "MATCH" | "MISMATCH" | "N/A",
@@ -52,6 +72,8 @@ def soft_confidence_score(checks):
     are re-normalised over whatever is available) - so a claim isn't
     penalised just because, say, Street View coverage doesn't exist
     for that address.
+
+    Returns (score_0_100: int, evidence_level: str)
     """
     # (signal_name, weight, pass_condition)
     weight_table = [
@@ -62,11 +84,13 @@ def soft_confidence_score(checks):
         ("lighting_check_result", 0.15, lambda v: v == "PASS"),
     ]
 
-    # Derive a simple exif_match bool from the raw distance, if EXIF exists
+    # Derive a simple exif_match bool from the raw distance, if EXIF exists.
+    # (The raw distance itself isn't written to the CSV anymore, but it's
+    # still used internally here to decide whether EXIF supports the claim.)
     exif_match = None
     if checks.get("exif_gps_present"):
         dist = checks.get("exif_gps_distance_m")
-        exif_match = (dist is not None and dist <= 300)  # matches config.EXIF_GPS_DISTANCE_THRESHOLD_M
+        exif_match = (dist is not None and dist <= config.EXIF_GPS_DISTANCE_THRESHOLD_M)
     checks = dict(checks)
     checks["exif_match"] = exif_match
 
@@ -84,9 +108,9 @@ def soft_confidence_score(checks):
             earned_weight += weight
 
     if total_weight == 0:
-        return 0.0, "no_signals_available"
+        return 0, "no_signals_available"
 
-    score = round(earned_weight / total_weight, 2)
+    score = round((earned_weight / total_weight) * 100)
     evidence_level = (
         "full evidence" if signals_used >= 4 else
         "partial evidence" if signals_used >= 2 else

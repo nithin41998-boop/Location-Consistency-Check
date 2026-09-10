@@ -1,17 +1,22 @@
 """
 main.py
 -------
-This is the file you actually run. It takes one claim (image + claimed
-address + claimed date/time), runs every check module, and writes two
-CSV files:
-  - main_verdict.csv   (short, reviewer-facing summary)
-  - audit_detail.csv   (every column, full evidence trail)
+This is the file you actually run.
+
+INPUT: a folder (e.g. on your Desktop) containing:
+  - all the claim photos
+  - ONE csv file with columns: filename, address, date, time
+    (time is optional - leave it blank if you don't have it)
+
+The program checks every row against its matching photo and writes ONE
+CSV file INTO THAT SAME FOLDER: results.csv (one row per claim, with
+the verdict plus full plain-language detail for each check).
 
 USAGE (see README.md for full setup steps):
-    python3 main.py --image photo.jpg --address "200 George Street, Sydney NSW" --datetime "2026-08-15 14:30"
+    python main.py --folder "C:/Users/you/Desktop/ClaimsToCheck"
 
-Each run APPENDS a new row to both CSVs, so you can process claims one
-at a time or in a batch script that calls this repeatedly.
+(A single-claim mode is also still available for quick one-off tests -
+see the --image/--address/--datetime options below.)
 """
 
 import argparse
@@ -28,22 +33,16 @@ import ocr_match
 import scoring
 
 
-MAIN_CSV_COLUMNS = [
-    "claim_id", "image_filename", "claimed_address_text",
-    "geocoded_latitude", "geocoded_longitude", "claimed_datetime",
-    "overall_confidence_score", "flagged_for_review", "severity", "flag_reason",
-]
-
-AUDIT_CSV_COLUMNS = MAIN_CSV_COLUMNS + [
+RESULTS_CSV_COLUMNS = [
+    "claim_id", "image_filename", "claimed_address_text", "claimed_datetime",
+    "geocoded_latitude", "geocoded_longitude",
+    "overall_confidence_score", "verdict", "severity", "flag_reason",
     "geocode_precision", "geocode_ambiguous",
-    "exif_gps_present", "exif_gps_distance_m", "exif_timestamp_present", "exif_time_diff_min",
-    "ocr_raw_text", "ocr_fuzzy_match_result", "ocr_similarity_score",
-    "vision_place_match_result", "vision_place_reasoning", "tier1_agreement",
-    "tier3_result", "tier3_notes",
-    "tier4_claimed_type", "tier4_observed_type", "tier4_result", "tier4_reasoning",
+    "exif_gps_present",
+    "tier1_signage_check", "tier3_location_plausibility_check", "tier4_property_type_check",
     "weather_claimed_category", "weather_observed_category", "weather_mismatch_level", "weather_reasoning",
     "lighting_result", "lighting_reasoning",
-    "evidence_level", "processed_timestamp",
+    "evidence_level",
 ]
 
 
@@ -56,13 +55,39 @@ def _write_row(path, columns, row_dict):
         writer.writerow({col: row_dict.get(col, "") for col in columns})
 
 
+def parse_claim_datetime(date_str, time_str=""):
+    """
+    Accepts a date ('2026-07-15') and an optional time in either 24-hour
+    ('14:00') or 12-hour ('2:00 PM') format. Returns a datetime, or None
+    if no usable date was given (weather/EXIF-time checks are then
+    skipped gracefully rather than failing).
+    """
+    date_str = (date_str or "").strip()
+    time_str = (time_str or "").strip()
+    if not date_str:
+        return None
+
+    if not time_str:
+        try:
+            return datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            return None
+
+    combined = f"{date_str} {time_str}"
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M %p", "%Y-%m-%d %I:%M%p"):
+        try:
+            return datetime.strptime(combined, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def verify_claim(claim_id, image_path, claimed_address_text, claimed_datetime):
     row = {
         "claim_id": claim_id,
         "image_filename": os.path.basename(image_path),
         "claimed_address_text": claimed_address_text,
         "claimed_datetime": claimed_datetime.isoformat() if claimed_datetime else "not provided",
-        "processed_timestamp": datetime.now().isoformat(),
     }
 
     # --- Step 0: forward geocode the claimed address into coordinates ---
@@ -74,53 +99,62 @@ def verify_claim(claim_id, image_path, claimed_address_text, claimed_datetime):
 
     if not geo["resolved"]:
         # Can't run anything downstream without coordinates - report and stop here
-        row["flagged_for_review"] = True
+        row["verdict"] = "Flagged"
         row["severity"] = "high"
         row["flag_reason"] = "Could not geocode claimed address at all"
-        row["overall_confidence_score"] = 0.0
+        row["overall_confidence_score"] = 0
         row["evidence_level"] = "no_signals_available"
+        row["tier1_signage_check"] = "Not run - address could not be located"
+        row["tier3_location_plausibility_check"] = "FAIL - claimed address does not resolve to any real location"
+        row["tier4_property_type_check"] = "Not run - address could not be located"
+        row["exif_gps_present"] = ""
+        row["weather_claimed_category"] = None
+        row["weather_observed_category"] = None
+        row["weather_reasoning"] = "Not run - address could not be located"
+        row["weather_mismatch_level"] = "N/A"
+        row["lighting_result"] = None
+        row["lighting_reasoning"] = "Not run - address could not be located"
         return row
 
     lat, lon = geo["latitude"], geo["longitude"]
 
-    # --- Metadata / EXIF ---
+    # --- Metadata / EXIF (used internally for scoring; only the simple
+    # presence flag is exposed in the CSV, not the raw numbers) ---
     meta = metadata.check_metadata(image_path, lat, lon, claimed_datetime)
-    row.update(meta)
+    row["exif_gps_present"] = meta["exif_gps_present"]
 
     # --- Tier 3: reverse geocoding plausibility (always runs) ---
     tier3 = geocoding.check_tier3(lat, lon)
-    row.update(tier3)
+    tier3_result = tier3["tier3_result"]
+    if tier3_result == "PASS":
+        row["tier3_location_plausibility_check"] = f"PASS - {tier3['tier3_notes']}"
+    else:
+        row["tier3_location_plausibility_check"] = f"FAIL - {tier3['tier3_notes']}"
 
-    # --- Tier 1: OCR + vision LLM place matching ---
+    # --- Tier 1: OCR + vision LLM place matching (two independent methods) ---
     nearby_places = geocoding.find_nearby_places(lat, lon)
     ocr_result = ocr_match.check_tier1_ocr(image_path, nearby_places)
-    row["ocr_raw_text"] = ocr_result["ocr_raw_text"]
-    row["ocr_fuzzy_match_result"] = ocr_result["ocr_fuzzy_match_result"]
-    row["ocr_similarity_score"] = ocr_result["ocr_similarity_score"]
-
     vision_place = vision_llm.check_scene_text_and_places(image_path, nearby_places)
-    row["vision_place_match_result"] = vision_place["category"]
-    row["vision_place_reasoning"] = vision_place["reasoning"] or vision_place["error"]
 
-    # Tier 1 agreement between the two independent methods.
-    # "only_non_location_text_found" (e.g. a bus destination board) is treated
-    # the same as "no_text_visible" - it's not usable location evidence either way.
     NO_EVIDENCE_CATEGORIES = (None, "no_text_visible", "only_non_location_text_found")
     ocr_says_match = ocr_result["ocr_fuzzy_match_result"] == "MATCH"
     vision_says_match = vision_place["category"] == "match"
     if ocr_result["ocr_fuzzy_match_result"] == "N/A" and vision_place["category"] in NO_EVIDENCE_CATEGORIES:
-        row["tier1_agreement"] = "N/A"
+        tier1_agreement = "N/A"
     elif ocr_says_match == vision_says_match:
-        row["tier1_agreement"] = "AGREE"
+        tier1_agreement = "AGREE"
     else:
-        row["tier1_agreement"] = "PARTIAL"
+        tier1_agreement = "PARTIAL"
+
+    vision_reasoning = vision_place["reasoning"] or vision_place["error"] or "No reasoning returned"
+    row["tier1_signage_check"] = f"[{tier1_agreement}] {vision_reasoning}"
 
     # --- Tier 4: property/environment type (vision LLM only - no plain-code equivalent) ---
     tier4 = vision_llm.check_property_type(image_path)
-    row["tier4_observed_type"] = tier4["category"]
-    row["tier4_reasoning"] = tier4["reasoning"] or tier4["error"]
-    row["tier4_claimed_type"] = geo["precision"]  # best proxy we have from the address itself
-    row["tier4_result"] = "N/A" if tier4["error"] else "MATCH"  # simple placeholder; refine with real property data if available
+    tier4_reasoning = tier4["reasoning"] or tier4["error"] or "No reasoning returned"
+    tier4_observed = tier4["category"] or "unknown"
+    row["tier4_property_type_check"] = f"Observed: {tier4_observed}. {tier4_reasoning}"
+    tier4_result_internal = "N/A" if tier4["error"] else "MATCH"
 
     # --- Weather: claimed record vs photo ---
     # Weather requires a specific claimed time (weather changes hour to hour),
@@ -149,10 +183,28 @@ def verify_claim(claim_id, image_path, claimed_address_text, claimed_datetime):
     row["lighting_reasoning"] = lighting["reasoning"] or lighting["error"]
 
     # --- Final scoring ---
-    flagged, severity, reason = scoring.determine_flag(row["tier3_result"], mismatch_level)
-    score, evidence_level = scoring.soft_confidence_score(row)
+    flagged, severity, reason = scoring.determine_flag(tier3_result, mismatch_level)
+    scoring_inputs = {
+        "tier1_agreement": tier1_agreement,
+        "tier4_result": tier4_result_internal,
+        "weather_mismatch_level": mismatch_level,
+        "exif_gps_present": meta["exif_gps_present"],
+        "exif_gps_distance_m": meta["exif_gps_distance_m"],
+        "lighting_check_result": "PASS" if lighting["category"] == "daytime" else lighting["category"],
+    }
+    score, evidence_level = scoring.soft_confidence_score(scoring_inputs)
 
-    row["flagged_for_review"] = flagged
+    # If no actual street name / shop name / fixed location signage was
+    # found anywhere in the photo (tier1_agreement "N/A" means neither OCR
+    # nor the vision check found usable location-indicating text), the
+    # score cannot be treated as fully confident - cap it at 90, even if
+    # every other check passed.
+    if tier1_agreement == "N/A":
+        score = min(score, config.NO_STREET_NAME_SCORE_CAP)
+
+    verdict = scoring.determine_verdict(flagged, score)
+
+    row["verdict"] = verdict
     row["severity"] = severity
     row["flag_reason"] = reason
     row["overall_confidence_score"] = score
@@ -161,32 +213,98 @@ def verify_claim(claim_id, image_path, claimed_address_text, claimed_datetime):
     return row
 
 
+def process_folder(folder):
+    """
+    Looks for one CSV file in the folder (columns: filename, address,
+    date, time), runs every row against its matching image, and writes
+    results.csv into that same folder.
+    """
+    if not os.path.isdir(folder):
+        print(f"ERROR: folder not found: {folder}")
+        return
+
+    exclude = {"results.csv"}
+    csv_candidates = [f for f in os.listdir(folder)
+                       if f.lower().endswith(".csv") and f not in exclude]
+    if not csv_candidates:
+        print(f"ERROR: no input CSV found in {folder}")
+        print("Expected a CSV with columns: filename, address, date, time")
+        return
+
+    input_csv = os.path.join(folder, csv_candidates[0])
+    print(f"Using input CSV: {input_csv}")
+
+    results_out = os.path.join(folder, "results.csv")
+
+    with open(input_csv, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    print(f"Found {len(rows)} claim(s) to check.\n")
+
+    for row in rows:
+        filename = (row.get("filename") or "").strip()
+        address = (row.get("address") or "").strip()
+        date_str = (row.get("date") or "").strip()
+        time_str = (row.get("time") or "").strip()
+
+        if not filename:
+            print("SKIPPED a row - no filename given")
+            continue
+
+        image_path = os.path.join(folder, filename)
+        if not os.path.isfile(image_path):
+            print(f"SKIPPED {filename} - image file not found in {folder}")
+            continue
+
+        claim_id = os.path.splitext(filename)[0]
+        claimed_dt = parse_claim_datetime(date_str, time_str)
+
+        print(f"Checking {filename} ...")
+        result_row = verify_claim(claim_id, image_path, address, claimed_dt)
+
+        _write_row(results_out, RESULTS_CSV_COLUMNS, result_row)
+
+        print(f"  Verdict: {result_row['verdict']}  Score: {result_row['overall_confidence_score']}/100\n")
+
+    print(f"Done. Results written to:\n  {results_out}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Verify an accident claim's photo against claimed location/time.")
-    parser.add_argument("--image", required=True, help="Path to the accident photo")
-    parser.add_argument("--address", required=True, help="Claimed address or street name")
-    parser.add_argument("--datetime", required=False, default=None,
-                         help="Claimed date/time, e.g. '2026-08-15 14:30'. Optional - if omitted, "
-                              "the weather check and EXIF time comparison are skipped, but every "
-                              "location check (Tier 1/3/4, EXIF GPS) still runs normally.")
+    parser = argparse.ArgumentParser(description="Verify accident claim photos against claimed location/time.")
+    parser.add_argument("--folder", default=None,
+                         help="Folder containing claim photos + one CSV (filename,address,date,time). "
+                              "Results are written into this same folder.")
+
+    # Single-claim mode, kept for quick one-off tests
+    parser.add_argument("--image", default=None, help="Path to a single accident photo")
+    parser.add_argument("--address", default=None, help="Claimed address or street name (single-claim mode)")
+    parser.add_argument("--datetime", default=None,
+                         help="Claimed date/time, e.g. '2026-08-15 14:30' (single-claim mode)")
     parser.add_argument("--claim-id", default=None, help="Optional claim ID (defaults to image filename)")
-    parser.add_argument("--outdir", default="output", help="Folder to write the CSV files into")
+    parser.add_argument("--outdir", default="output", help="Folder to write CSVs into (single-claim mode only)")
     args = parser.parse_args()
+
+    if args.folder:
+        process_folder(args.folder)
+        return
+
+    if not args.image or not args.address:
+        parser.error("Either --folder, or both --image and --address, are required.")
 
     claimed_dt = datetime.strptime(args.datetime, "%Y-%m-%d %H:%M") if args.datetime else None
     claim_id = args.claim_id or os.path.splitext(os.path.basename(args.image))[0]
 
     os.makedirs(args.outdir, exist_ok=True)
-
     result_row = verify_claim(claim_id, args.image, args.address, claimed_dt)
 
-    _write_row(os.path.join(args.outdir, "main_verdict.csv"), MAIN_CSV_COLUMNS, result_row)
-    _write_row(os.path.join(args.outdir, "audit_detail.csv"), AUDIT_CSV_COLUMNS, result_row)
+    results_path = os.path.join(args.outdir, "results.csv")
+    _write_row(results_path, RESULTS_CSV_COLUMNS, result_row)
 
     print(f"Claim {claim_id} processed.")
-    print(f"  Flagged: {result_row['flagged_for_review']}  Severity: {result_row['severity']}")
-    print(f"  Confidence score: {result_row['overall_confidence_score']}")
-    print(f"  Results written to {args.outdir}/main_verdict.csv and {args.outdir}/audit_detail.csv")
+    print(f"  Verdict: {result_row['verdict']}  Severity: {result_row['severity']}")
+    print(f"  Confidence score: {result_row['overall_confidence_score']}/100")
+    print(f"  Results written to {results_path}")
 
 
 if __name__ == "__main__":
