@@ -57,28 +57,33 @@ def _write_row(path, columns, row_dict):
 
 def parse_claim_datetime(date_str, time_str=""):
     """
-    Accepts a date ('2026-07-15') and an optional time in either 24-hour
-    ('14:00') or 12-hour ('2:00 PM') format. Returns a datetime, or None
-    if no usable date was given (weather/EXIF-time checks are then
-    skipped gracefully rather than failing).
+    Accepts a date in ISO (2026-07-15) or day-first (6/11/2024, 26/06/2025,
+    26-06-2025) format, plus an optional time in 24-hour ('14:00') or
+    12-hour ('2:00 PM') format. Returns a datetime, or None if no usable
+    date was given. Prints a warning if a date was given but could not be
+    read, so weather is never skipped silently.
     """
     date_str = (date_str or "").strip()
-    time_str = (time_str or "").strip()
+    time_str = (time_str or "").strip().upper()
     if not date_str:
         return None
 
-    if not time_str:
-        try:
-            return datetime.strptime(date_str, "%Y-%m-%d")
-        except ValueError:
-            return None
+    date_formats = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d.%m.%Y")
+    time_formats = ("%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M%p", "%I:%M:%S %p", "%I %p", "%I%p")
 
-    combined = f"{date_str} {time_str}"
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M %p", "%Y-%m-%d %I:%M%p"):
-        try:
-            return datetime.strptime(combined, fmt)
-        except ValueError:
-            continue
+    for dfmt in date_formats:
+        if not time_str:
+            try:
+                return datetime.strptime(date_str, dfmt)
+            except ValueError:
+                continue
+        for tfmt in time_formats:
+            try:
+                return datetime.strptime(f"{date_str} {time_str}", f"{dfmt} {tfmt}")
+            except ValueError:
+                continue
+
+    print(f"  WARNING: could not read date/time '{date_str} {time_str}' - weather check will be skipped")
     return None
 
 
@@ -139,7 +144,8 @@ def verify_claim(claim_id, image_path, claimed_address_text, claimed_datetime):
     NO_EVIDENCE_CATEGORIES = (None, "no_text_visible", "only_non_location_text_found")
     ocr_says_match = ocr_result["ocr_fuzzy_match_result"] == "MATCH"
     vision_says_match = vision_place["category"] == "match"
-    if ocr_result["ocr_fuzzy_match_result"] == "N/A" and vision_place["category"] in NO_EVIDENCE_CATEGORIES:
+    if not ocr_says_match and vision_place["category"] in NO_EVIDENCE_CATEGORIES:
+        # Neither method found a positive location clue -> no evidence either way.
         tier1_agreement = "N/A"
     elif ocr_says_match == vision_says_match:
         tier1_agreement = "AGREE"
@@ -241,6 +247,7 @@ def process_folder(folder):
         rows = list(reader)
 
     print(f"Found {len(rows)} claim(s) to check.\n")
+    last = vision_llm.get_usage()
 
     for row in rows:
         filename = (row.get("filename") or "").strip()
@@ -265,8 +272,19 @@ def process_folder(folder):
 
         _write_row(results_out, RESULTS_CSV_COLUMNS, result_row)
 
-        print(f"  Verdict: {result_row['verdict']}  Score: {result_row['overall_confidence_score']}/100\n")
+        print(f"  Verdict: {result_row['verdict']}  Score: {result_row['overall_confidence_score']}/100")
+        now = vision_llm.get_usage()
+        print(f"  Tokens this claim: {now['input_tokens'] - last['input_tokens']} in / "
+              f"{now['output_tokens'] - last['output_tokens']} out "
+              f"({now['calls'] - last['calls']} AI calls)\n")
+        last = now
 
+    total = vision_llm.get_usage()
+    print("TOKEN USAGE FOR THIS RUN")
+    print(f"  AI calls:      {total['calls']}")
+    print(f"  Input tokens:  {total['input_tokens']:,}")
+    print(f"  Output tokens: {total['output_tokens']:,}")
+    print(f"  Total tokens:  {total['input_tokens'] + total['output_tokens']:,}\n")
     print(f"Done. Results written to:\n  {results_out}")
 
 

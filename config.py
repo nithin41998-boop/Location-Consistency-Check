@@ -1,4 +1,4 @@
-"""
+﻿"""
 config.py
 ---------
 All settings live here so you (or your supervisor) can tune thresholds
@@ -36,7 +36,7 @@ BEDROCK_API_KEY = os.environ.get("BEDROCK_API_KEY", "")
 
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")  # Sydney region
 BEDROCK_MODEL_ID = os.environ.get(
-    "BEDROCK_MODEL_ID", "anthropic.claude-sonnet-4-6-v1:0"
+    "BEDROCK_MODEL_ID", "au.anthropic.claude-haiku-4-5-20251001-v1:0"
 )  # confirm the exact model ID enabled in Truuth's Bedrock console - it varies by account/region
 
 # Optional - only needed if you want Tier 2 (Street View) enabled.

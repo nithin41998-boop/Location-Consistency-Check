@@ -32,6 +32,22 @@ except ImportError:
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 
+# Running total of tokens used by every vision call in this run.
+USAGE = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+
+
+def _record_usage(usage):
+    """usage is the 'usage' dict the API returns: input_tokens / output_tokens."""
+    USAGE["calls"] += 1
+    if usage:
+        USAGE["input_tokens"] += usage.get("input_tokens", 0) or 0
+        USAGE["output_tokens"] += usage.get("output_tokens", 0) or 0
+
+
+def get_usage():
+    """Returns a copy of the running token totals."""
+    return dict(USAGE)
+
 
 def _encode_image(image_path):
     mime_type, _ = mimetypes.guess_type(image_path)
@@ -65,6 +81,7 @@ def _call_anthropic_direct(image_data, mime_type, prompt):
     resp = requests.post(ANTHROPIC_API_URL, headers=headers, json=body, timeout=60)
     resp.raise_for_status()
     data = resp.json()
+    _record_usage(data.get("usage"))
     return data["content"][0]["text"].strip()
 
 
@@ -108,6 +125,7 @@ def _call_bedrock(image_data, mime_type, prompt):
         accept="application/json",
     )
     response_body = json.loads(response["body"].read())
+    _record_usage(response_body.get("usage"))
     return response_body["content"][0]["text"].strip()
 
 
