@@ -229,22 +229,28 @@ def process_folder(folder):
         print(f"ERROR: folder not found: {folder}")
         return
 
-    exclude = {"results.csv"}
-    csv_candidates = [f for f in os.listdir(folder)
-                       if f.lower().endswith(".csv") and f not in exclude]
-    if not csv_candidates:
-        print(f"ERROR: no input CSV found in {folder}")
-        print("Expected a CSV with columns: filename, address, date, time")
-        return
-
-    input_csv = os.path.join(folder, csv_candidates[0])
-    print(f"Using input CSV: {input_csv}")
-
     results_out = os.path.join(folder, "results.csv")
 
-    with open(input_csv, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
+    # Report mode: if the folder holds incident report PDFs, read the claimed
+    # location, date, time and photo out of each report.
+    has_pdfs = any(f.lower().endswith(".pdf") for f in os.listdir(folder))
+    if has_pdfs:
+        import report_reader
+        print(f"Reading incident reports in {folder} ...")
+        rows = report_reader.read_reports_in_folder(folder)
+    else:
+        exclude = {"results.csv"}
+        csv_candidates = [f for f in os.listdir(folder)
+                           if f.lower().endswith(".csv") and f not in exclude]
+        if not csv_candidates:
+            print(f"ERROR: no incident report PDFs or input CSV found in {folder}")
+            print("Expected PDF reports, or a CSV with columns: filename, address, date, time")
+            return
+
+        input_csv = os.path.join(folder, csv_candidates[0])
+        print(f"Using input CSV: {input_csv}")
+        with open(input_csv, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
 
     print(f"Found {len(rows)} claim(s) to check.\n")
     last = vision_llm.get_usage()
@@ -259,7 +265,10 @@ def process_folder(folder):
             print("SKIPPED a row - no filename given")
             continue
 
-        image_path = os.path.join(folder, filename)
+        image_path = row.get("_image_path") or os.path.join(folder, filename)
+        if row.get("_source"):
+            print(f"Report: {row['_source']}")
+            print(f"  Claimed location: {address}  |  date: {date_str}  |  time: {time_str}")
         if not os.path.isfile(image_path):
             print(f"SKIPPED {filename} - image file not found in {folder}")
             continue

@@ -11,10 +11,12 @@ can't do:
   - Weather: what conditions are visible in the photo?
   - Lighting: does it look like day/night/dusk?
 
-Supports TWO ways of reaching Claude, controlled by config.VISION_LLM_PROVIDER:
+Supports THREE providers, controlled by config.VISION_LLM_PROVIDER
+(or the VISION_LLM_PROVIDER environment variable):
   - "anthropic": direct Anthropic API key (ANTHROPIC_API_KEY env var)
   - "bedrock":   AWS Bedrock (uses boto3 + your AWS credentials)
-Ask your supervisor which one Truuth uses before running this for real.
+  - "openai":    OpenAI API (OPENAI_API_KEY env var; model from OPENAI_MODEL,
+                 default gpt-5.6-luna)
 """
 
 import base64
@@ -129,6 +131,39 @@ def _call_bedrock(image_data, mime_type, prompt):
     return response_body["content"][0]["text"].strip()
 
 
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+
+
+def _call_openai(image_data, mime_type, prompt):
+    """Sends the photo + question to OpenAI's chat completions API."""
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    model = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        # Generous limit: reasoning models spend part of this on hidden thinking.
+        "max_completion_tokens": 1500,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:{mime_type};base64,{image_data}"}},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+    }
+    resp = requests.post(OPENAI_API_URL, headers=headers, json=body, timeout=90)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"OpenAI API error {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    usage = data.get("usage") or {}
+    _record_usage({"input_tokens": usage.get("prompt_tokens", 0),
+                   "output_tokens": usage.get("completion_tokens", 0)})
+    return (data["choices"][0]["message"]["content"] or "").strip()
+
+
 def ask_vision_llm(image_path, question, allowed_categories=None):
     """
     Sends the image + a question to Claude, via whichever provider is
@@ -145,6 +180,9 @@ def ask_vision_llm(image_path, question, allowed_categories=None):
 
     if provider == "anthropic" and not config.ANTHROPIC_API_KEY:
         result["error"] = "ANTHROPIC_API_KEY not set - skipping vision check"
+        return result
+    if provider == "openai" and not os.environ.get("OPENAI_API_KEY"):
+        result["error"] = "OPENAI_API_KEY not set - skipping vision check"
         return result
     if provider == "bedrock" and boto3 is None:
         result["error"] = "boto3 not installed - skipping vision check (pip install boto3)"
@@ -175,6 +213,8 @@ def ask_vision_llm(image_path, question, allowed_categories=None):
     try:
         if provider == "bedrock":
             raw_text = _call_bedrock(image_data, mime_type, prompt)
+        elif provider == "openai":
+            raw_text = _call_openai(image_data, mime_type, prompt)
         else:
             raw_text = _call_anthropic_direct(image_data, mime_type, prompt)
 
